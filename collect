@@ -1,0 +1,511 @@
+#include "main.h"
+#include "stdio.h"
+#include "stdlib.h"
+#include "string.h"
+#include "i2c.h"
+
+I2C_HandleTypeDef hi2c1;
+I2C_HandleTypeDef hi2c2;
+GPIO_InitTypeDef GPIO_InitStruct;
+UART_HandleTypeDef huart1;
+UART_HandleTypeDef huart2;
+
+#define BH1750_ADDR 0x23 // BH1750传感器的I2C地址
+#define SHT30_DEVICE_ADDRESS 0x44	//SHT30传感器的I2C地址
+#define SGP30_ADDRESS	0x58		// SGP30传感器的I2C地址
+
+uint8_t com_buffer[10];
+/* 定义SHT30传感器的温度和湿度变量 */
+float temperature = 0;
+uint8_t humidity = 0;
+
+//时钟信号
+void SystemClock_Config(void);
+//引脚
+static void MX_GPIO_Init(void);
+//i2c1
+static void MX_I2C1_Init(void);
+//i2c2
+static void MX_I2C2_Init(void);
+//usart1
+static void MX_USART1_UART_Init(void);
+//usart2
+static void MX_USART2_UART_Init(void);
+
+//光照传感器
+void BH1750_Init(void);
+//读取光照传感器数据
+uint16_t BH1750_Read(void);
+/* 初始化SHT30传感器 */
+void SHT30_Init(void);
+
+/* 获取SHT30传感器的温度和湿度数据 */
+void SHT30_GetData(void);
+
+uint8_t rx_buffer[10];
+uint8_t rx_index = 0;
+int main(void)
+{
+	
+	
+	char envi_buffer[50];
+	uint8_t co2_buffer[6];
+
+	uint16_t co2;
+  HAL_Init();
+  /* Configure the system clock */
+  SystemClock_Config();
+  MX_GPIO_Init();
+  MX_I2C1_Init();
+  MX_I2C2_Init();
+  MX_USART1_UART_Init();
+	MX_USART2_UART_Init();
+	HAL_UART_Receive_IT(&huart2, &rx_buffer[rx_index], 1);
+	/* 初始化模拟I2C通信 */
+  I2C_Init();
+
+  /* 初始化BH1750传感器 */
+  BH1750_Init();
+	// 初始化SGP30传感器
+  co2_buffer[0] = 0x20;
+  co2_buffer[1] = 0x03;
+	
+  HAL_I2C_Master_Transmit(&hi2c2, SGP30_ADDRESS << 1, co2_buffer, 2, HAL_MAX_DELAY);
+  HAL_Delay(10);
+	
+  while (1)
+  {
+		//读取光照强度
+		uint16_t lux = BH1750_Read();
+		//读取温湿度
+		SHT30_GetData();
+	// 发送获取CO2数据命令
+    co2_buffer[0] = 0x20;
+    co2_buffer[1] = 0x08;
+    HAL_I2C_Master_Transmit(&hi2c2, SGP30_ADDRESS << 1, co2_buffer, 2, HAL_MAX_DELAY);
+
+    // 等待数据获取完成
+    HAL_Delay(100);
+
+    // 读取CO2数据
+    HAL_I2C_Master_Receive(&hi2c2, SGP30_ADDRESS << 1, co2_buffer, 6, HAL_MAX_DELAY);
+    co2 = co2_buffer[0] << 8 |co2_buffer[1];	
+		sprintf(envi_buffer, "Lux:%d, Temp:%.1f, Hum:%d, CO2:%d\n", lux, temperature, humidity, co2);
+		//HAL_UART_Transmit(&huart1, (uint8_t*)envi_buffer, strlen(envi_buffer), HAL_MAX_DELAY);
+		//HAL_UART_Transmit(&huart2, (uint8_t*)envi_buffer, strlen(envi_buffer), HAL_MAX_DELAY);
+    //HAL_Delay(5000);
+  }
+
+}
+
+void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart)
+{
+
+
+    if (huart->Instance == USART2) // 如果是 USART2 接收到数据
+    {
+        rx_buffer[rx_index++] = USART2->DR; 
+		
+        if (rx_index >= 10) 
+        {
+            rx_index = 0;
+        }
+
+        //if (rx_buffer[rx_index - 1] == '\n'){           
+
+						HAL_UART_Transmit(&huart1, (uint8_t*)rx_buffer,strlen((char *)rx_buffer), HAL_MAX_DELAY); 
+						memset(rx_buffer, 0, 10);
+            rx_index = 0; 
+       // }
+
+        HAL_UART_Receive_IT(&huart2, &rx_buffer[rx_index], 1); 
+    }
+
+
+}
+
+
+void SystemClock_Config(void) { 
+  RCC_OscInitTypeDef RCC_OscInitStruct = {0}; 
+  RCC_ClkInitTypeDef RCC_ClkInitStruct = {0};
+
+  /** Initializes the RCC Oscillators according to the specified parameters in the RCC_OscInitTypeDef structure. */ 
+  RCC_OscInitStruct.OscillatorType = RCC_OSCILLATORTYPE_HSI; 
+  RCC_OscInitStruct.HSIState = RCC_HSI_ON; 
+  RCC_OscInitStruct.HSICalibrationValue = RCC_HSICALIBRATION_DEFAULT; 
+  RCC_OscInitStruct.PLL.PLLState = RCC_PLL_ON; 
+  RCC_OscInitStruct.PLL.PLLSource = RCC_PLLSOURCE_HSI_DIV2; 
+  RCC_OscInitStruct.PLL.PLLMUL = RCC_PLL_MUL16; 
+  if (HAL_RCC_OscConfig(&RCC_OscInitStruct) != HAL_OK) { 
+    Error_Handler(); 
+  } 
+  
+  /* Initializes the CPU, AHB and APB buses clocks */ 
+  RCC_ClkInitStruct.ClockType = RCC_CLOCKTYPE_HCLK|RCC_CLOCKTYPE_SYSCLK |RCC_CLOCKTYPE_PCLK1|RCC_CLOCKTYPE_PCLK2; 
+  RCC_ClkInitStruct.SYSCLKSource = RCC_SYSCLKSOURCE_PLLCLK; 
+  RCC_ClkInitStruct.AHBCLKDivider = RCC_SYSCLK_DIV1; 
+  RCC_ClkInitStruct.APB1CLKDivider = RCC_HCLK_DIV2; 
+  RCC_ClkInitStruct.APB2CLKDivider = RCC_HCLK_DIV1;
+
+  if (HAL_RCC_ClockConfig(&RCC_ClkInitStruct, FLASH_LATENCY_2) != HAL_OK) { 
+    Error_Handler(); 
+  } 
+}
+
+void I2C_Start(void)
+{
+    HAL_GPIO_WritePin(SDA_GPIO_PORT, SDA_PIN, GPIO_PIN_SET);
+    HAL_GPIO_WritePin(SCL_GPIO_PORT, SCL_PIN, GPIO_PIN_SET);
+    HAL_Delay(1);
+    HAL_GPIO_WritePin(SDA_GPIO_PORT, SDA_PIN, GPIO_PIN_RESET);
+    HAL_Delay(1);
+    HAL_GPIO_WritePin(SCL_GPIO_PORT, SCL_PIN, GPIO_PIN_RESET);
+}
+
+void I2C_Stop(void)
+{
+    HAL_GPIO_WritePin(SDA_GPIO_PORT, SDA_PIN, GPIO_PIN_RESET);
+    HAL_GPIO_WritePin(SCL_GPIO_PORT, SCL_PIN, GPIO_PIN_SET);
+    HAL_Delay(1);
+    HAL_GPIO_WritePin(SDA_GPIO_PORT, SDA_PIN, GPIO_PIN_SET);
+    HAL_Delay(1);
+}
+
+void I2C_Ack(void)
+{
+    HAL_GPIO_WritePin(SDA_GPIO_PORT, SDA_PIN, GPIO_PIN_RESET);
+    HAL_GPIO_WritePin(SCL_GPIO_PORT, SCL_PIN, GPIO_PIN_SET);
+    HAL_Delay(1);
+    HAL_GPIO_WritePin(SCL_GPIO_PORT, SCL_PIN, GPIO_PIN_RESET);
+    HAL_GPIO_WritePin(SDA_GPIO_PORT, SDA_PIN, GPIO_PIN_SET);
+    HAL_Delay(1);
+}
+
+void I2C_Nack(void)
+{
+    HAL_GPIO_WritePin(SDA_GPIO_PORT, SDA_PIN, GPIO_PIN_SET);
+    HAL_GPIO_WritePin(SCL_GPIO_PORT, SCL_PIN, GPIO_PIN_SET);
+    HAL_Delay(1);
+    HAL_GPIO_WritePin(SCL_GPIO_PORT, SCL_PIN, GPIO_PIN_RESET);
+    HAL_Delay(1);
+}
+
+uint8_t I2C_WaitAck(void)
+{
+    uint8_t ack = 0;
+    HAL_GPIO_WritePin(SDA_GPIO_PORT, SDA_PIN, GPIO_PIN_SET);
+    HAL_GPIO_WritePin(SCL_GPIO_PORT, SCL_PIN, GPIO_PIN_SET);
+    HAL_Delay(1);
+    if (HAL_GPIO_ReadPin(SDA_GPIO_PORT, SDA_PIN) == GPIO_PIN_RESET)
+    {
+        ack = 1;
+    }
+    HAL_GPIO_WritePin(SCL_GPIO_PORT, SCL_PIN, GPIO_PIN_RESET);
+    HAL_Delay(1);
+    return ack;
+}
+
+void I2C_SendByte(uint8_t data)
+{
+    uint8_t i;
+    for (i = 0; i < 8; i++)
+    {
+        if (data & 0x80)
+        {
+            HAL_GPIO_WritePin(SDA_GPIO_PORT, SDA_PIN, GPIO_PIN_SET);
+        }
+        else
+        {
+            HAL_GPIO_WritePin(SDA_GPIO_PORT, SDA_PIN, GPIO_PIN_RESET);
+        }
+        HAL_GPIO_WritePin(SCL_GPIO_PORT, SCL_PIN, GPIO_PIN_SET);
+        HAL_Delay(1);
+        HAL_GPIO_WritePin(SCL_GPIO_PORT, SCL_PIN, GPIO_PIN_RESET);
+        HAL_Delay(1);
+        data <<= 1;
+    }
+}
+
+uint8_t I2C_ReceiveByte(void)
+{
+    uint8_t i, data = 0;
+    for (i = 0; i < 8; i++)
+    {
+        data <<= 1;
+        HAL_GPIO_WritePin(SCL_GPIO_PORT, SCL_PIN, GPIO_PIN_SET);
+        HAL_Delay(1);
+        if (HAL_GPIO_ReadPin(SDA_GPIO_PORT, SDA_PIN) == GPIO_PIN_SET)
+        {
+            data |= 0x01;
+        }
+        HAL_GPIO_WritePin(SCL_GPIO_PORT, SCL_PIN, GPIO_PIN_RESET);
+        HAL_Delay(1);
+    }
+    return data;
+}
+
+void I2C_WriteByte(uint8_t addr, uint8_t data)
+{
+    I2C_Start();
+    I2C_SendByte(addr << 1);
+    if (!I2C_WaitAck())
+    {
+        I2C_Stop();
+        return;
+    }
+    I2C_SendByte(data);
+    I2C_WaitAck();
+    I2C_Stop();
+}
+
+uint8_t I2C_ReadByte(uint8_t addr)
+{
+    uint8_t data;
+    I2C_Start();
+    I2C_SendByte((addr << 1) | 0x01);
+    I2C_WaitAck();
+    data = I2C_ReceiveByte();
+    I2C_Nack();
+    I2C_Stop();
+    return data;
+}
+
+void I2C_Init(void)
+{
+    SDA_GPIO_CLK_ENABLE();
+    SCL_GPIO_CLK_ENABLE();
+
+    GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_OD;
+    GPIO_InitStruct.Pull = GPIO_PULLUP;
+    GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_HIGH;
+    GPIO_InitStruct.Pin = SDA_PIN;
+    HAL_GPIO_Init(SDA_GPIO_PORT, &GPIO_InitStruct);
+
+    GPIO_InitStruct.Pin = SCL_PIN;
+    HAL_GPIO_Init(SCL_GPIO_PORT, &GPIO_InitStruct);
+
+    HAL_GPIO_WritePin(SDA_GPIO_PORT, SDA_PIN, GPIO_PIN_SET);
+    HAL_GPIO_WritePin(SCL_GPIO_PORT, SCL_PIN, GPIO_PIN_SET);
+}
+
+void BH1750_Init(void)
+{
+    I2C_WriteByte(BH1750_ADDR, 0x01); // 上电
+		I2C_WriteByte(BH1750_ADDR, 0x07);
+    I2C_WriteByte(BH1750_ADDR, 0x10); // 设置为高分辨率模式
+}
+
+uint16_t BH1750_Read(void)
+{
+    uint8_t data[2];
+    uint16_t lux;
+    I2C_Start();
+    I2C_SendByte((BH1750_ADDR << 1) | 0x01);
+    I2C_WaitAck();
+    data[0] = I2C_ReceiveByte();
+    I2C_Ack();
+    data[1] = I2C_ReceiveByte();
+    I2C_Nack();
+    I2C_Stop();
+
+    lux = (data[0] << 8) | data[1];
+    lux /= 1.2; // 转换为光照强度
+    return lux;
+}
+
+static void MX_GPIO_Init(void)
+{
+   GPIO_InitTypeDef GPIO_InitStruct = {0};
+
+  /* GPIO Ports Clock Enable */
+  __HAL_RCC_GPIOA_CLK_ENABLE();
+  __HAL_RCC_GPIOB_CLK_ENABLE();
+	__HAL_RCC_GPIOC_CLK_ENABLE(); 
+
+  /*Configure GPIO pin Output Level */
+  HAL_GPIO_WritePin(GPIOA, GPIO_PIN_5, GPIO_PIN_RESET);
+	HAL_GPIO_WritePin(GPIOC, GPIO_PIN_14, GPIO_PIN_SET);
+	HAL_GPIO_WritePin(GPIOC, GPIO_PIN_15, GPIO_PIN_RESET);
+
+  /*Configure GPIO pin : PA5 */
+  GPIO_InitStruct.Pin = GPIO_PIN_5;
+  GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
+  GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
+  HAL_GPIO_Init(GPIOA, &GPIO_InitStruct);
+
+  /*Configure GPIO pin : PB0 */
+  GPIO_InitStruct.Pin = GPIO_PIN_0;
+  GPIO_InitStruct.Mode = GPIO_MODE_INPUT;
+  GPIO_InitStruct.Pull = GPIO_PULLUP;
+  HAL_GPIO_Init(GPIOB, &GPIO_InitStruct);
+	 
+	 // 配置PA6和PA7引脚为开漏输出模式
+	GPIO_InitStruct.Pin = GPIO_PIN_6 | GPIO_PIN_7;
+	GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_OD;
+	GPIO_InitStruct.Pull = GPIO_NOPULL;
+	GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
+	HAL_GPIO_Init(GPIOA, &GPIO_InitStruct);
+	
+  //PA9,PA10
+  GPIO_InitStruct.Pin = GPIO_PIN_9| GPIO_PIN_10; 
+  GPIO_InitStruct.Mode = GPIO_MODE_AF_PP; 
+  GPIO_InitStruct.Pull = GPIO_NOPULL; 
+  GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_HIGH; 
+  HAL_GPIO_Init(GPIOA, &GPIO_InitStruct);
+	
+
+	//PB6,PB7
+	GPIO_InitStruct.Pin = GPIO_PIN_6 | GPIO_PIN_7;
+  GPIO_InitStruct.Mode = GPIO_MODE_AF_OD;
+  GPIO_InitStruct.Pull = GPIO_NOPULL;
+  GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_HIGH;
+  HAL_GPIO_Init( GPIOB, &GPIO_InitStruct);
+	
+	//PB10,PB11
+	GPIO_InitStruct.Pin = GPIO_PIN_10 | GPIO_PIN_11;
+  GPIO_InitStruct.Mode = GPIO_MODE_AF_OD;
+  GPIO_InitStruct.Pull = GPIO_NOPULL;
+  GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_HIGH;
+  HAL_GPIO_Init( GPIOB, &GPIO_InitStruct);
+	
+	 //PA2
+  GPIO_InitStruct.Pin = GPIO_PIN_2| GPIO_PIN_3; 
+  GPIO_InitStruct.Mode = GPIO_MODE_AF_PP; 
+  GPIO_InitStruct.Pull = GPIO_NOPULL; 
+  GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_HIGH; 
+  HAL_GPIO_Init(GPIOA, &GPIO_InitStruct);
+	
+	GPIO_InitStruct.Pin = GPIO_PIN_14|GPIO_PIN_15;
+  GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
+  GPIO_InitStruct.Pull = GPIO_NOPULL;
+  GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
+  HAL_GPIO_Init(GPIOC, &GPIO_InitStruct);
+	
+}
+
+
+static void MX_I2C1_Init(void)
+{
+  __HAL_RCC_I2C1_CLK_ENABLE();
+  hi2c1.Instance = I2C1;
+  hi2c1.Init.ClockSpeed = 100000;
+  hi2c1.Init.DutyCycle = I2C_DUTYCYCLE_2;
+  hi2c1.Init.OwnAddress1 = 0;
+  hi2c1.Init.AddressingMode = I2C_ADDRESSINGMODE_7BIT;
+  hi2c1.Init.DualAddressMode = I2C_DUALADDRESS_DISABLE;
+  hi2c1.Init.OwnAddress2 = 0;
+  hi2c1.Init.GeneralCallMode = I2C_GENERALCALL_DISABLE;
+  hi2c1.Init.NoStretchMode = I2C_NOSTRETCH_DISABLE;
+  if (HAL_I2C_Init(&hi2c1) != HAL_OK)
+  {
+    Error_Handler();
+  }
+
+}
+
+static void MX_I2C2_Init(void)
+{
+
+	__HAL_RCC_I2C2_CLK_ENABLE();
+  hi2c2.Instance = I2C2;
+  hi2c2.Init.ClockSpeed = 100000;
+  hi2c2.Init.DutyCycle = I2C_DUTYCYCLE_2;
+  hi2c2.Init.OwnAddress1 = 0;
+  hi2c2.Init.AddressingMode = I2C_ADDRESSINGMODE_7BIT;
+  hi2c2.Init.DualAddressMode = I2C_DUALADDRESS_DISABLE;
+  hi2c2.Init.OwnAddress2 = 0;
+  hi2c2.Init.GeneralCallMode = I2C_GENERALCALL_DISABLE;
+  hi2c2.Init.NoStretchMode = I2C_NOSTRETCH_DISABLE;
+  if (HAL_I2C_Init(&hi2c2) != HAL_OK)
+  {
+    Error_Handler();
+  }
+
+
+}
+
+
+static void MX_USART1_UART_Init(void)
+{
+
+  huart1.Instance = USART1;
+  huart1.Init.BaudRate = 115200;
+  huart1.Init.WordLength = UART_WORDLENGTH_8B;
+  huart1.Init.StopBits = UART_STOPBITS_1;
+  huart1.Init.Parity = UART_PARITY_NONE;
+  huart1.Init.Mode = UART_MODE_TX_RX;
+  huart1.Init.HwFlowCtl = UART_HWCONTROL_NONE;
+  huart1.Init.OverSampling = UART_OVERSAMPLING_16;
+  if (HAL_UART_Init(&huart1) != HAL_OK)
+  {
+    Error_Handler();
+  }
+ 
+}
+
+static void MX_USART2_UART_Init(void)
+{
+
+  huart2.Instance = USART2;
+  huart2.Init.BaudRate = 115200;
+  huart2.Init.WordLength = UART_WORDLENGTH_8B;
+  huart2.Init.StopBits = UART_STOPBITS_1;
+  huart2.Init.Parity = UART_PARITY_NONE;
+  huart2.Init.Mode = UART_MODE_TX_RX;
+  huart2.Init.HwFlowCtl = UART_HWCONTROL_NONE;
+  huart2.Init.OverSampling = UART_OVERSAMPLING_16;
+  if (HAL_UART_Init(&huart2) != HAL_OK)
+  {
+    Error_Handler();
+  }
+ 
+}
+
+/* 初始化SHT30传感器 
+static void SHT30_Init(void)
+{
+  uint8_t init_cmd[2] = {0x30, 0xa2};
+  HAL_I2C_Master_Transmit(&hi2c1, SHT30_DEVICE_ADDRESS<<1, init_cmd, 2, HAL_MAX_DELAY);
+}
+*/
+
+/* 获取SHT30传感器的温度和湿度数据 */
+static void SHT30_GetData(void)
+{
+  /* 发送SHT30传感器的测量命令 */
+  uint8_t meas_cmd[2] = {0x27, 0x37};
+  HAL_I2C_Master_Transmit(&hi2c1, SHT30_DEVICE_ADDRESS<<1, meas_cmd, 2, HAL_MAX_DELAY);
+  
+  /* 延时等待测量完成 */
+  HAL_Delay(50);
+  
+  /* 读取SHT30传感器的数据 */
+  uint8_t data[6] = {0};
+  HAL_I2C_Master_Receive(&hi2c1, SHT30_DEVICE_ADDRESS<<1, data, 6, HAL_MAX_DELAY);
+  
+  /* 计算温度和湿度值 */
+  uint16_t temp_raw = (data[0] << 8) | data[1];
+  temperature = -45 + (175 * (float)temp_raw / 65535);
+  uint16_t humi_raw = (data[3] << 8) | data[4];
+  humidity = 100 * (float)humi_raw / 65535;
+}
+
+
+void Error_Handler(void)
+{
+ 
+  __disable_irq();
+  while (1)
+  {
+  }
+  
+}
+
+#ifdef  USE_FULL_ASSERT
+
+void assert_failed(uint8_t *file, uint32_t line)
+{
+  
+}
+#endif /* USE_FULL_ASSERT */
+
