@@ -1,0 +1,276 @@
+//socket表,能发不断开
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+#include <signal.h>
+#include <sys/wait.h>
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
+#include <mysql/mysql.h>
+
+#define MAXLINE 1024
+#define SERV_PORT 8001
+
+typedef struct {
+    int sockfd;
+    int id;
+} client_socket;
+
+void handle_client(int connfd, MYSQL *mysql_conn);
+void handle_signal(int signum);
+void parse_environment_data(char *data, int *light, float *temp, int *hum, int *co2);
+void write_message_to_client(int sockfd, char *message, int sender_connfd);
+
+client_socket sockets[2];
+int target_connfd = -1;
+pid_t client1_pid = 0;
+
+int main(int argc, char **argv) {
+    int listenfd, connfd;
+    pid_t childpid;
+    socklen_t clilen;
+    struct sockaddr_in cliaddr, servaddr;
+
+    // Create a socket
+    listenfd = socket(AF_INET, SOCK_STREAM, 0);
+
+    // Bind the socket to a local address and port
+    bzero(&servaddr, sizeof(servaddr));
+    servaddr.sin_family = AF_INET;
+    servaddr.sin_addr.s_addr = htonl(INADDR_ANY);
+    servaddr.sin_port = htons(SERV_PORT);
+// Bind the socket to a local address and port
+if (bind(listenfd, (struct sockaddr *)&servaddr, sizeof(servaddr)) < 0) {
+    perror("bind error");
+    exit(1);
+}
+
+// Listen for incoming connections
+if (listen(listenfd, 5) < 0) {
+    perror("listen error");
+    exit(1);
+}
+
+    // Register signal handler for child processes
+    signal(SIGCHLD, handle_signal);
+
+    // Connect to MySQL database
+     MYSQL mysql;
+    // 初始化 MySQL 连接
+    mysql_init(&mysql);
+    if (mysql_real_connect(&mysql, "39.99.224.71", "root", "201968", "intelligeagri", 3306, (char*)NULL, 0) == NULL) {
+        perror("connect mysql error");
+        exit(1);
+    }
+    printf("数据库已连接\n");
+    for (;;) {
+        clilen = sizeof(cliaddr);
+        connfd = accept(listenfd, (struct sockaddr *)&cliaddr, &clilen);
+
+        // Fork a child process to handle the client
+        if ((childpid = fork()) == 0) {
+            close(listenfd);
+            handle_client(connfd, mysql_conn);
+            exit(0);
+        }
+
+        // Record the client's PID and socket information
+        if (client1_pid == 0) {
+            client1_pid = childpid;
+            for (int i = 0; i < 2;i++) {
+                if (sockets[i].sockfd == 0) {
+                    sockets[i].sockfd = connfd;
+                    sockets[i].id = 1;
+                    printf("客户端%d：%d\n", sockets[i].id, sockets[i].sockfd);
+                    break;
+                }
+            }
+        } else {
+            for (int i = 0; i < 2; i++) {
+                if (sockets[i].sockfd == 0) {
+                    sockets[i].sockfd = connfd;
+                    sockets[i].id = 2;
+                    printf("客户端%d：%d\n", sockets[i].id, sockets[i].sockfd);
+                    break;
+                }
+            }
+        }
+    }
+}
+
+void handle_client(int connfd, MYSQL *mysql_conn) {
+    ssize_t n;
+    char recvline[MAXLINE];
+
+    int light, hum, co2;
+    float temp;
+    char sql_query[MAXLINE];
+    struct sockaddr_in addr;
+    socklen_t addr_len = sizeof(addr);
+    
+    printf("%d已连接\n", connfd);
+
+    // Add the's socket information to the socket table
+    for (int i = 0; i < 2; i++) {
+        if(sockets[i].sockfd == connfd) {
+            sockets[i].id = i + 1;
+            printf("客户端%d：%d\n", sockets[i].id, sockets[i].sockfd);
+            break;
+        }
+    }
+
+    for (;;) {
+        // Read data from client
+        memset(recvline, 0, MAXLINE);
+        if ((n = read(connfd, recvline, MAXLINE)) == 0) {
+            printf("%d断开连接\n", connfd);
+            break;
+        } else if (n < 0) {
+            perror("read error");
+            break;
+        }
+
+        printf("%d发送的数据：%s\n", connfd, recvline);
+
+        // Handle message from Client 2
+        if (connfd == sockets[0].sockfd) {
+            target_connfd = sockets[1].sockfd;
+        } else {
+            target_connfd = sockets[0].sockfd;
+        }
+        if (recvline[0] == '0' && recvline[1] == 'x') {
+            write_message_to_client(target_connfd, recvline, connfd);
+           printf("向%d写入数据%s\n",target_connfd,recvline);
+            close(connfd);
+            break;
+        }
+
+
+        printf("%d发送数据：%s\n",target_connfd,recvline);
+        handle_environment_data(recvline, mysql);
+        
+        // 断开数据库连接
+        mysql_close(&mysql);
+
+        // // Insert environment data into database
+        // sprintf(sql_query, "INSERT INTO environment(Time, Temperature, Humidity, Light, CO2) VALUES(NOW(),%f,%d,%d,%d)",temp, hum, light, co2);
+        // if (mysql_query(mysql_conn, sql_query)) {
+        //     fprintf(stderr, "Failed to insert data into database: %s\n",mysql_error(mysql_conn));
+        //     break;
+        // }
+    }
+}
+
+void handle_signal(int signum) {
+    pid_t pid;
+    int status;
+
+    while ((pid = waitpid(-1, &status, WNOHANG)) > 0) {
+        if (pid == client1_pid) {
+            client1_pid = 0;
+            sockets[0].sockfd = 0;
+            printf("Waiting for Client 1 to connect...\n");
+        } else {
+            sockets[1].sockfd = 0;
+            printf("Waiting for Client 2 to connect...\n");
+        }
+    }
+}
+
+void handle_environment_data(char *data, MYSQL mysql) {
+    char *saveptr;
+    char *token = strtok_r(data, ", ", &saveptr);
+    char *lux_str = NULL;
+    char *temp_str = NULL;
+    char *hum_str = NULL;
+    char *co2_str = NULL;
+
+    while (token != NULL) {
+        char *key = strtok(token, ":");
+        char *value = strtok(NULL, ":");
+        if (key != NULL && value != NULL) {
+            if (strcmp(key, "Lux") == 0) {
+                printf("Lux: %s\n", value);
+                if (lux_str != NULL) {
+                    free(lux_str);
+                }
+                lux_str = strdup(value);
+            } else if (strcmp(key, "Temp") == 0) {
+                printf("Temp: %s\n", value);
+                if (temp_str != NULL) {
+                    free(temp_str);
+                }
+                temp_str = strdup(value);
+            } else if (strcmp(key, "Hum") == 0) {
+                printf("Hum: %s\n", value);
+                if (hum_str != NULL) {
+                    free(hum_str);
+                }
+                hum_str = strdup(value);
+            } else if (strcmp(key, "CO2") == 0) {
+                printf("CO2: %s\n", value);
+                if (co2_str != NULL) {
+                    free(co2_str);
+                }
+                co2_str = strdup(value);
+            }
+        }
+        token = strtok_r(NULL, ", ", &saveptr);
+    }
+
+    // 将数据保存到 MySQL 数据库中
+    char query[1024];
+    snprintf(query, sizeof(query), "INSERT INTO environment(Time, Temperature, Humidity, Light, CO2) VALUES(NOW(), ?, ?, ?, ?)");
+
+    MYSQL_STMT *stmt = mysql_stmt_init(mysql);
+    if (!stmt) {
+        perror("mysql_stmt_init() failed");
+        exit(1);
+    }
+
+    if (mysql_stmt_prepare(stmt, query, strlen(query)) != 0) {
+        perror("mysql_stmt_prepare() failed");
+        exit(1);
+    }
+
+    MYSQL_BIND bind[4];
+    memset(bind, 0, sizeof(bind));
+
+    float temp = atof(temp_str);
+    float hum = atof(hum_str);
+    float lux = atof(lux_str);
+    float co2 = atof(co2_str);
+
+    bind[0].buffer_type = MYSQL_TYPE_FLOAT;
+    bind[0].buffer = &temp;
+    bind[1].buffer_type = MYSQL_TYPE_FLOAT;
+    bind[1].buffer = &hum;
+    bind[2].buffer_type = MYSQL_TYPE_FLOAT;
+    bind[2].buffer = &lux;
+    bind[3].buffer_type = MYSQL_TYPE_FLOAT;
+    bind[3].buffer = &co2;
+
+    if (mysql_stmt_bind_param(stmt, bind) != 0) {
+        perror("mysql_stmt_bind_param() failed");
+        exit(1);
+    }
+
+    if (mysql_stmt_execute(stmt) != 0) {
+        perror("mysql_stmt_execute() failed");
+        exit(1);
+    }
+
+    mysql_stmt_close(stmt);
+
+    // 清空缓存区
+    memset(data, 0, MAX_LINE);
+}
+
+
+void write_message_to_client(int sockfd, char *message, int sender_connfd) {
+    char sendline[10];
+    sprintf(sendline, "%s\n", message);
+    write(sockfd,sendline, strlen(sendline));
+}
